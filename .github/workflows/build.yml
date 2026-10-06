@@ -69,7 +69,7 @@ jobs:
       - name: Package (pkg + dmg, ad-hoc signed)
         if: inputs.what == 'package'
         run: |
-          set -e
+          set -eo pipefail
           VERSION=$(grep -m1 -E '^project\(MixReference VERSION' src/CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*//')
           bash src/scripts/package-macos.sh build out "$VERSION" 2>&1 | grep -E '^\[package\]|FILES THAT NEED' | head -60
           ls out
