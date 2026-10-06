@@ -70,7 +70,7 @@ jobs:
         if: inputs.what == 'package'
         run: |
           set -eo pipefail
-          VERSION=$(grep -m1 -E '^project\(MixReference VERSION' src/CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*//')
+          VERSION=$(grep -m1 'VERSION' src/CMakeLists.txt | awk '{print $3}')
           bash src/scripts/package-macos.sh build out "$VERSION" 2>&1 | grep -E '^\[package\]|FILES THAT NEED' | head -60
           ls out
 
