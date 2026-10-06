@@ -71,7 +71,7 @@ jobs:
         run: |
           set -eo pipefail
           VERSION=$(grep -m1 'VERSION' src/CMakeLists.txt | awk '{print $3}')
-          bash src/scripts/package-macos.sh build out "$VERSION" > package.log 2>&1 && ok=1 || ok=0
+          bash -x src/scripts/package-macos.sh build out "$VERSION" > package.log 2>&1 && ok=1 || ok=0
           grep -E '^\[package\]|FILES THAT NEED|^  [0-9]+[.][0-9]+' package.log | head -60 || true
           if [ "$ok" != 1 ]; then echo '--- last lines of the failed step:'; tail -n 25 package.log; exit 1; fi
           ls out
