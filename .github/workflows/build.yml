@@ -1,0 +1,59 @@
+name: macOS build (manual)
+
+# Manual only: no pull_request / push triggers, so forks can never run this with the secrets.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag of the private source repository"
+        default: "mac-port"
+        required: true
+      what:
+        description: "core-tests = compile and run the platform-independent tests; plugin = build the VST3"
+        default: "core-tests"
+        required: true
+        type: choice
+        options: [core-tests, plugin]
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    runs-on: macos-14   # Apple Silicon runner; the universal binary is cross-compiled for x86_64 too
+    timeout-minutes: 45
+    steps:
+      - name: Clone the private source (token stays in a secret, never printed)
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -e
+          AUTH=$(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            clone --quiet --depth 1 --branch "$REF" https://github.com/creativepfb/mix-reference.git src
+          git -C src log -1 --format='source commit: %h'
+
+      - name: Get JUCE 8.0.4
+        run: git clone --quiet --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git juce
+
+      - name: Configure
+        run: |
+          set -e
+          if [ "${{ inputs.what }}" = "core-tests" ]; then PLUGIN=OFF; else PLUGIN=ON; fi
+          # -fno-caret-diagnostics: compiler messages must not print lines of the private source into this public log
+          cmake -S src -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15 \
+            -DCMAKE_CXX_FLAGS="-fno-caret-diagnostics" -DCMAKE_C_FLAGS="-fno-caret-diagnostics" \
+            -DMR_BUILD_PLUGIN=$PLUGIN -DMR_JUCE_PATH="$PWD/juce" -DMR_ENABLE_AAX=OFF > configure.log 2>&1 || { echo "configure failed"; grep -E "CMake Error" -A3 configure.log | head -20; exit 1; }
+          echo "configure ok"
+
+      - name: Build
+        run: |
+          set -e
+          cmake --build build > build.log 2>&1 || { echo "build failed - error lines only:"; grep -E "error:|Error " build.log | head -40; exit 1; }
+          echo "build ok"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
