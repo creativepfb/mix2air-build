@@ -13,7 +13,15 @@ on:
         default: "core-tests"
         required: true
         type: choice
-        options: [core-tests, plugin]
+        options: [core-tests, plugin, package]
+      upload:
+        description: "package only: upload the DMG to the private release repository"
+        default: false
+        type: boolean
+      tag:
+        description: "package + upload: release tag in the private release repository (use a beta tag for test builds)"
+        default: "mix2air-mac-beta"
+        required: false
 
 permissions:
   contents: read
@@ -57,3 +65,24 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Package (pkg + dmg, ad-hoc signed)
+        if: inputs.what == 'package'
+        run: |
+          set -e
+          VERSION=$(grep -m1 -E '^project\(MixReference VERSION' src/CMakeLists.txt | sed -E 's/.*VERSION ([0-9.]+).*//')
+          bash src/scripts/package-macos.sh build out "$VERSION" 2>&1 | grep -E '^\[package\]|FILES THAT NEED' | head -60
+          ls out
+
+      - name: Upload to the private release (never as a workflow artifact)
+        if: inputs.what == 'package' && inputs.upload
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          DMG=$(ls out/*.dmg | head -1)
+          cp "$DMG" "$TAG-macos.dmg"
+          gh release view "$TAG" --repo creativepfb/ml-releases >/dev/null 2>&1 ||             gh release create "$TAG" --repo creativepfb/ml-releases --title "Mix2Air (macOS beta)" --prerelease --notes "macos beta build"
+          gh release upload "$TAG" "$TAG-macos.dmg" --repo creativepfb/ml-releases --clobber
+          echo "uploaded $TAG-macos.dmg ($(stat -f%z "$TAG-macos.dmg") bytes)"
