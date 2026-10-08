@@ -118,7 +118,7 @@ jobs:
           mkdir -p shim/google_crc32c
           cp src/remote/macos/google_crc32c_shim.py shim/google_crc32c/__init__.py
           printf '[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n[project]\nname = "google-crc32c"\nversion = "1.9.0"\ndescription = "Pure Python stand-in used by the Mix2Air macOS runtime"\n[tool.setuptools]\npackages = ["google_crc32c"]\n' > shim/pyproject.toml
-          arch -$ARCH $PY -m pip wheel shim --no-deps -w repaired > /dev/null 2>&1
+          arch -$ARCH $PY -m pip wheel ./shim --no-deps -w repaired > shim-build.log 2>&1 || { tail -20 shim-build.log; exit 1; }
           ls repaired
 
       - name: Install everything for this CPU type into one folder (wheels compatible with the minimum macOS)
