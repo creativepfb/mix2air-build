@@ -1,0 +1,168 @@
+name: macOS remote libraries (manual)
+
+# Builds the native Python libraries of the Mix2Air Remote feature for macOS (one folder per CPU type), with an LGPL-only FFmpeg.
+# Manual only, secrets only used to clone the private source and to upload to the PRIVATE release; nothing is published as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag of the private source repository"
+        default: "codex/remote-preview"
+        required: true
+      upload:
+        description: "Upload the result to the private release repository (tag mix2air-mac-remote-libs)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  libs:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64,  target: "11.0",  pbs: aarch64 }
+          - { arch: x86_64, target: "10.15", pbs: x86_64 }
+    runs-on: macos-14
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target }}
+      ARCH: ${{ matrix.arch }}
+      PBS_TAG: "20261003"
+      PYV: "3.13.16"
+      FFMPEG_TAG: "n8.1.3"
+      OPUS_VERSION: "1.5.2"
+      AV_VERSION: "16.1.0"
+    steps:
+      - name: Clone the private source (token stays in a secret, never printed)
+        env:
+          SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -e
+          AUTH=$(printf 'x-access-token:%s' "$SOURCE_TOKEN" | base64)
+          echo "::add-mask::$AUTH"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
+            clone --quiet --depth 1 --branch "$REF" https://github.com/creativepfb/mix-reference.git src
+          git -C src log -1 --format='source commit: %h'
+
+      - name: Tools and CPU type
+        run: |
+          set -e
+          brew install pkgconf >/dev/null 2>&1 || true
+          if [ "$ARCH" = "x86_64" ]; then
+            arch -x86_64 /usr/bin/true 2>/dev/null || { sudo softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1; arch -x86_64 /usr/bin/true; }
+            echo "x86_64 (Rosetta) ok"
+          fi
+
+      - name: Python for this CPU type (python-build-standalone, SHA256 verified)
+        run: |
+          set -e
+          base="https://github.com/astral-sh/python-build-standalone/releases/download/$PBS_TAG"
+          name="cpython-$PYV+$PBS_TAG-${{ matrix.pbs }}-apple-darwin-install_only.tar.gz"
+          curl -fsSL -o SHA256SUMS "$base/SHA256SUMS"
+          curl -fsSL -o py.tgz "$base/$(echo "$name" | sed 's/+/%2B/')"
+          expected="$(grep -F " $name" SHA256SUMS | awk '{print $1}' | head -1)"
+          actual="$(shasum -a 256 py.tgz | awk '{print $1}')"
+          [ -n "$expected" ] && [ "$expected" = "$actual" ] || { echo "SHA256 mismatch"; exit 1; }
+          mkdir -p pyroot && tar -xzf py.tgz -C pyroot
+          echo "PY=$PWD/pyroot/python/bin/python3" >> "$GITHUB_ENV"
+
+      - name: Build libopus (static, this CPU type)
+        run: |
+          set -e
+          curl -fsSL -o opus.tgz "https://github.com/xiph/opus/releases/download/v$OPUS_VERSION/opus-$OPUS_VERSION.tar.gz"
+          tar -xzf opus.tgz
+          mkdir -p "$PWD/deps"
+          cd "opus-$OPUS_VERSION"
+          arch -$ARCH ./configure --prefix="$PWD/../deps" --disable-shared --enable-static --disable-doc --disable-extra-programs \
+            CC="clang -arch $ARCH" CFLAGS="-O2 -fPIC -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET" > ../opus-configure.log 2>&1
+          arch -$ARCH make -j4 > ../opus-build.log 2>&1
+          arch -$ARCH make install > /dev/null 2>&1
+          ls ../deps/lib/pkgconfig
+
+      - name: Build an LGPL-only FFmpeg (shared libraries, no GPL parts, no auto-detected extras)
+        run: |
+          set -e
+          git clone --quiet --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg
+          cd ffmpeg
+          X86=""
+          if [ "$ARCH" = "x86_64" ]; then X86="--disable-x86asm"; fi
+          PKG_CONFIG_PATH="$PWD/../deps/lib/pkgconfig" arch -$ARCH ./configure --prefix="$PWD/../ffprefix" --arch=$ARCH \
+            --cc="clang -arch $ARCH" --enable-shared --disable-static --disable-programs --disable-doc \
+            --disable-gpl --disable-nonfree --disable-autodetect --enable-libopus $X86 \
+            --extra-cflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET" --extra-ldflags="-mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET" \
+            > ../ffmpeg-configure.log 2>&1 || { tail -30 ../ffmpeg-configure.log; exit 1; }
+          grep -E "^License:" ../ffmpeg-configure.log
+          grep -q "^License: LGPL" ../ffmpeg-configure.log || { echo "NOT LGPL - stopping"; exit 1; }
+          arch -$ARCH make -j4 > ../ffmpeg-build.log 2>&1 || { tail -30 ../ffmpeg-build.log; exit 1; }
+          arch -$ARCH make install > /dev/null 2>&1
+          ls ../ffprefix/lib | head -20
+
+      - name: Build PyAV against it (wheel) and bundle the FFmpeg libraries into the wheel
+        run: |
+          set -e
+          mkdir -p wheels repaired
+          arch -$ARCH $PY -m pip install --quiet --upgrade pip setuptools wheel cython delocate
+          export PKG_CONFIG_PATH="$PWD/ffprefix/lib/pkgconfig"
+          export ARCHFLAGS="-arch $ARCH"
+          arch -$ARCH $PY -m pip wheel "av==$AV_VERSION" --no-binary av --no-deps -w wheels > av-build.log 2>&1 || { tail -40 av-build.log; exit 1; }
+          arch -$ARCH $PY -m delocate.cmd.delocate_wheel -w repaired -L .dylibs --require-archs=$ARCH wheels/av-*.whl
+          ls -la repaired
+
+      - name: Pure-Python stand-in for google-crc32c (no native wheel exists for every Mac)
+        run: |
+          set -e
+          mkdir -p shim/google_crc32c
+          cp src/remote/macos/google_crc32c_shim.py shim/google_crc32c/__init__.py
+          printf '[build-system]\nrequires = ["setuptools"]\nbuild-backend = "setuptools.build_meta"\n[project]\nname = "google-crc32c"\nversion = "1.9.0"\ndescription = "Pure Python stand-in used by the Mix2Air macOS runtime"\n[tool.setuptools]\npackages = ["google_crc32c"]\n' > shim/pyproject.toml
+          arch -$ARCH $PY -m pip wheel shim --no-deps -w repaired > /dev/null 2>&1
+          ls repaired
+
+      - name: Install everything for this CPU type into one folder (wheels compatible with the minimum macOS)
+        run: |
+          set -e
+          T="${MACOSX_DEPLOYMENT_TARGET//./_}"
+          mkdir -p "out/python-libs-$ARCH"
+          arch -$ARCH $PY -m pip install --quiet --target "out/python-libs-$ARCH" --only-binary=:all: \
+            --platform "macosx_${T}_$ARCH" --python-version 3.13 --implementation cp --abi cp313 \
+            --find-links repaired "aiortc==1.14.0" "aiohttp==3.13.3" "numpy==2.2.6" "av==$AV_VERSION" "google-crc32c==1.9.0"
+          find "out/python-libs-$ARCH" -name __pycache__ -type d -prune -exec rm -rf {} +
+          rm -rf "out/python-libs-$ARCH/bin"
+          ls "out/python-libs-$ARCH" | head -60
+
+      - name: Check the minimum macOS of every native file
+        run: |
+          set -e
+          ver_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+          highest=0; bad=""; n=0
+          while IFS= read -r -d '' f; do
+            file -b "$f" | grep -q "Mach-O" || continue
+            m="$(vtool -arch $ARCH -show-build "$f" 2>/dev/null | awk '/^ *(minos|version) /{print $2; exit}' || true)"
+            [ -n "$m" ] || continue
+            n=$((n+1)); if ver_gt "$m" "$highest"; then highest="$m"; fi
+            if ver_gt "$m" "$MACOSX_DEPLOYMENT_TARGET"; then bad="$bad\n  $m  ${f#out/}"; fi
+          done < <(find "out/python-libs-$ARCH" -type f -print0)
+          echo "checked $n Mach-O files; highest macOS requirement: $highest (target is $MACOSX_DEPLOYMENT_TARGET)"
+          if [ -n "$bad" ]; then printf "FILES NEWER THAN THE TARGET:%b\n" "$bad" | head -20; fi
+
+      - name: Remote stack tests on this CPU type (WebRTC stereo loopback, encoder, quality policy)
+        run: |
+          set -e
+          export PYTHONPATH="$PWD/out/python-libs-$ARCH"
+          cd src/remote
+          arch -$ARCH $PY ../remote/macos/ci_remote_selftest.py
+
+      - name: Pack and upload to the private release (never as a workflow artifact)
+        if: inputs.upload
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -e
+          tar -czf "remote-libs-$ARCH.tar.gz" -C out "python-libs-$ARCH"
+          gh release view mix2air-mac-remote-libs --repo creativepfb/ml-releases >/dev/null 2>&1 || \
+            gh release create mix2air-mac-remote-libs --repo creativepfb/ml-releases --title "Mix2Air macOS remote libraries (build input)" --prerelease --notes "build input, not a product"
+          gh release upload mix2air-mac-remote-libs "remote-libs-$ARCH.tar.gz" --repo creativepfb/ml-releases --clobber
+          echo "uploaded remote-libs-$ARCH.tar.gz ($(stat -f%z "remote-libs-$ARCH.tar.gz") bytes)"

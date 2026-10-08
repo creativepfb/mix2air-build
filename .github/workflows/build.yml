@@ -66,6 +66,21 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      - name: Fetch the Remote libraries for macOS (private release, only if they exist)
+        if: inputs.what == 'package'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -e
+          if gh release view mix2air-mac-remote-libs --repo creativepfb/ml-releases >/dev/null 2>&1; then
+            mkdir -p remote-libs
+            gh release download mix2air-mac-remote-libs --repo creativepfb/ml-releases -p 'remote-libs-*.tar.gz' -D remote-libs --clobber
+            ls remote-libs
+            echo "REMOTE_LIBS_DIR=$PWD/remote-libs" >> "$GITHUB_ENV"
+          else
+            echo "no Remote libraries published yet: building without Remote"
+          fi
+
       - name: Package (pkg + dmg, ad-hoc signed)
         if: inputs.what == 'package'
         run: |
